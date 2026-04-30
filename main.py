@@ -274,12 +274,14 @@ async def send_photo(
                 files={"document": (f"photo.{ext}", photo_bytes, mime)},
             )
             tg_j = tg_r.json()
-            log.info(f"sendPhoto ok={tg_j.get('ok')} "
+            log.info(f"sendDocument ok={tg_j.get('ok')} "
                      f"err={tg_j.get('description', '')}")
             return {
-                "sent":      tg_j.get("ok", False),
-                "has_photo": True,
-                "tg_error":  tg_j.get("description"),
+                "sent":        tg_j.get("ok", False),
+                "has_photo":   True,
+                "original_size": f"{w}x{h}",
+                "final_size":    f"{img.width}x{img.height}",
+                "tg_error":    tg_j.get("description"),
             }
         else:
             # No photo — send text message
@@ -300,5 +302,5 @@ async def send_photo(
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.2.0-document",
+    return {"status": "ok", "version": "3.3.0-debug",
             "max_concurrent": MAX_CONC}
