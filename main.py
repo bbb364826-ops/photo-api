@@ -8,12 +8,14 @@ Env: BOT_TOKEN, API_KEY, MAX_CONCURRENT
 """
 
 import asyncio
+import io
 import logging
 import os
 import re
 from typing import Optional
 
 import httpx
+from PIL import Image
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -244,11 +246,29 @@ async def send_photo(
             mime = result.get("mime", "image/jpeg")
             ext  = "jpg" if "jpeg" in mime else mime.split("/")[-1]
 
+            # ── Upscale small photos ────────────────────────────────────
+            photo_bytes = result["photo_bytes"]
+            try:
+                img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+                w, h = img.size
+                TARGET = 800
+                if max(w, h) < TARGET:
+                    scale = TARGET / max(w, h)
+                    new_w, new_h = int(w * scale), int(h * scale)
+                    img = img.resize((new_w, new_h), Image.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=88)
+                    photo_bytes = buf.getvalue()
+                    mime = "image/jpeg"
+                    ext  = "jpg"
+                    log.info(f"Upscaled {w}x{h} → {new_w}x{new_h}")
+            except Exception as e:
+                log.warning(f"Upscale failed, sending original: {e}")
+
             tg_r = await client.post(
                 f"{tg_base}/sendPhoto",
                 data={"chat_id": chat_id, "caption": caption},
-                files={"photo": (f"photo.{ext}",
-                                 result["photo_bytes"], mime)},
+                files={"photo": (f"photo.{ext}", photo_bytes, mime)},
             )
             tg_j = tg_r.json()
             log.info(f"sendPhoto ok={tg_j.get('ok')} "
@@ -277,5 +297,5 @@ async def send_photo(
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.0.0-lightweight",
+    return {"status": "ok", "version": "3.1.0-upscale",
             "max_concurrent": MAX_CONC}
