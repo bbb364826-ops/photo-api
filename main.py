@@ -293,11 +293,27 @@ async def send_photo(
                 "tg_error":    tg_j.get("description"),
             }
         else:
-            # No photo — send text message
-            log.info(f"No photo ({result.get('error')}), sending text")
+            # No photo — send CEC link so user can view it in browser
+            log.info(f"No photo ({result.get('error')}), sending CEC link")
+            gvari_geo_display = lat_to_geo(req.gvari.strip())
+            msg_text = (
+                f"🪪 {piadi}\n"
+                f"👤 {gvari_geo_display}\n\n"
+                f"📸 ფოტოს სანახავად გახსენი CEC-ის საიტი:\n"
+                f"პირადი №: {piadi}\nგვარი: {gvari_geo_display}"
+            )
+            cec_link = "https://ems-voters.cec.gov.ge/"
             tg_r = await client.post(
                 f"{tg_base}/sendMessage",
-                json={"chat_id": chat_id, "text": caption},
+                json={
+                    "chat_id": chat_id,
+                    "text": msg_text,
+                    "reply_markup": {
+                        "inline_keyboard": [[
+                            {"text": "📸 ფოტო CEC-ზე", "url": cec_link}
+                        ]]
+                    }
+                },
             )
             tg_j = tg_r.json()
             return {
