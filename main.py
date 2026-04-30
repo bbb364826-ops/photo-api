@@ -13,11 +13,13 @@ import logging
 import os
 import re
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from PIL import Image
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -293,16 +295,19 @@ async def send_photo(
                 "tg_error":    tg_j.get("description"),
             }
         else:
-            # No photo — send CEC link so user can view it in browser
-            log.info(f"No photo ({result.get('error')}), sending CEC link")
+            # No photo — send proxy link that auto-fills CEC form
+            log.info(f"No photo ({result.get('error')}), sending proxy link")
             gvari_geo_display = lat_to_geo(req.gvari.strip())
             msg_text = (
                 f"🪪 {piadi}\n"
                 f"👤 {gvari_geo_display}\n\n"
-                f"📸 ფოტოს სანახავად გახსენი CEC-ის საიტი:\n"
-                f"პირადი №: {piadi}\nგვარი: {gvari_geo_display}"
+                f"📸 ფოტოს სანახავად დააჭირე ღილაკს:"
             )
-            cec_link = "https://ems-voters.cec.gov.ge/"
+            proxy_url = (
+                f"https://photo-api.fly.dev/cec-proxy"
+                f"?piadi={quote(piadi, safe='')}"
+                f"&gvari={quote(gvari_geo_display, safe='')}"
+            )
             tg_r = await client.post(
                 f"{tg_base}/sendMessage",
                 json={
@@ -310,7 +315,7 @@ async def send_photo(
                     "text": msg_text,
                     "reply_markup": {
                         "inline_keyboard": [[
-                            {"text": "📸 ფოტო CEC-ზე", "url": cec_link}
+                            {"text": "📸 ფოტო და მონაცემები", "url": proxy_url}
                         ]]
                     }
                 },
@@ -324,8 +329,149 @@ async def send_photo(
             }
 
 
+# ── Endpoint: GET /cec-proxy ─────────────────────────────────────────────────
+@app.get("/cec-proxy", response_class=HTMLResponse)
+async def cec_proxy(piadi: str = "", gvari: str = ""):
+    """
+    Server-side proxy: fetches CEC result page and returns it with
+    all relative URLs rewritten to absolute CEC URLs, so the user's
+    browser renders the real result (photo + voter data) immediately.
+    """
+    if not piadi:
+        return HTMLResponse("<p>Missing piadi</p>", status_code=400)
+
+    gvari_geo = gvari.strip()  # already Georgian from send_photo
+
+    try:
+        async with httpx.AsyncClient(
+            headers=HEADERS,
+            follow_redirects=True,
+            timeout=25,
+        ) as client:
+            # Step 1: GET homepage → CSRF token
+            r1 = await client.get(CEC_URL)
+            r1.raise_for_status()
+            soup1 = BeautifulSoup(r1.text, "html.parser")
+            csrf_input = soup1.find("input", {"name": "__RequestVerificationToken"})
+            csrf_token = csrf_input["value"] if csrf_input else ""
+
+            # Step 2: POST search form
+            r2 = await client.post(
+                CEC_URL,
+                data={
+                    "__RequestVerificationToken": csrf_token,
+                    "PersonalId": piadi,
+                    "Surname":    gvari_geo,
+                },
+                headers={
+                    **HEADERS,
+                    "Referer":      CEC_URL,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Cookie": "; ".join(f"{k}={v}" for k, v in r1.cookies.items()),
+                },
+            )
+            r2.raise_for_status()
+
+            html = r2.text
+            base = CEC_URL.rstrip("/")
+
+            # Rewrite relative src/href to absolute CEC URLs
+            html = re.sub(
+                r'((?:src|href|action)\s*=\s*")(/[^"]*)"',
+                lambda m: f'{m.group(1)}{base}{m.group(2)}"',
+                html,
+            )
+            html = re.sub(
+                r"((?:src|href|action)\s*=\s*')(/[^']*)'",
+                lambda m: f"{m.group(1)}{base}{m.group(2)}'",
+                html,
+            )
+            # Rewrite url(...) in inline styles
+            html = re.sub(
+                r'url\(["\']?(/[^)"\']+)["\']?\)',
+                lambda m: f'url("{base}{m.group(1)}")',
+                html,
+            )
+
+            # Inject info bar at top of page
+            bar = (
+                f'<div style="position:fixed;top:0;left:0;right:0;z-index:9999;'
+                f'background:#c0392b;color:#fff;padding:8px 16px;font-size:15px;'
+                f'font-family:sans-serif;display:flex;gap:20px;align-items:center;'
+                f'box-shadow:0 2px 6px rgba(0,0,0,.3)">'
+                f'<span>🪪 {piadi}</span>'
+                f'<span>👤 {gvari_geo}</span>'
+                f'</div>'
+                f'<div style="height:44px"></div>'
+            )
+            html = re.sub(r"(<body[^>]*>)", r"\1" + bar, html, flags=re.IGNORECASE)
+
+            return HTMLResponse(content=html)
+
+    except httpx.HTTPStatusError as e:
+        log.warning(f"cec_proxy HTTP error {e.response.status_code} for {piadi}")
+        # Fallback: return auto-submit form page (user's browser, not our server, hits CEC)
+        return HTMLResponse(content=_cec_form_page(piadi, gvari_geo))
+    except Exception as e:
+        log.exception(f"cec_proxy error for {piadi}: {e}")
+        return HTMLResponse(content=_cec_form_page(piadi, gvari_geo))
+
+
+def _cec_form_page(piadi: str, gvari_geo: str) -> str:
+    """
+    Fallback HTML: auto-submits the CEC search form directly from the
+    user's browser (bypasses our server → no IP block).
+    """
+    return f"""<!DOCTYPE html>
+<html lang="ka">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CEC — {piadi}</title>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:sans-serif;background:#f4f4f4;display:flex;
+         align-items:center;justify-content:center;min-height:100vh}}
+    .card{{background:#fff;border-radius:14px;padding:32px 28px;
+           max-width:340px;width:100%;text-align:center;
+           box-shadow:0 4px 20px rgba(0,0,0,.12)}}
+    .spinner{{width:48px;height:48px;border:5px solid #eee;
+              border-top-color:#c0392b;border-radius:50%;
+              animation:spin .8s linear infinite;margin:0 auto 20px}}
+    @keyframes spin{{to{{transform:rotate(360deg)}}}}
+    .info{{font-size:15px;color:#444;margin-bottom:6px}}
+    .bold{{font-weight:700;font-size:16px;color:#222}}
+    .note{{font-size:13px;color:#888;margin-top:14px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <p class="info">CEC-ის საიტზე გადამისამართება...</p>
+    <p class="bold">🪪 {piadi}</p>
+    <p class="bold">👤 {gvari_geo}</p>
+    <p class="note">ბრაუზერი ავტომატურად შეავსებს მონაცემებს</p>
+  </div>
+  <form id="f" action="https://ems-voters.cec.gov.ge/" method="POST"
+        style="display:none">
+    <input name="PersonalId" value="{piadi}">
+    <input name="Surname"    value="{gvari_geo}">
+    <input name="__RequestVerificationToken" value="">
+  </form>
+  <script>
+    // Let browser establish CEC session first, then submit
+    window.addEventListener('load', function() {{
+      setTimeout(function() {{
+        document.getElementById('f').submit();
+      }}, 600);
+    }});
+  </script>
+</body>
+</html>"""
+
+
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.4.0-headers",
+    return {"status": "ok", "version": "3.5.0-proxy",
             "max_concurrent": MAX_CONC}
