@@ -246,29 +246,32 @@ async def send_photo(
             mime = result.get("mime", "image/jpeg")
             ext  = "jpg" if "jpeg" in mime else mime.split("/")[-1]
 
-            # ── Upscale small photos ────────────────────────────────────
+            # ── Upscale + sharpen, then send as Document (no Telegram compression) ──
             photo_bytes = result["photo_bytes"]
             try:
+                from PIL import ImageFilter, ImageEnhance
                 img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
                 w, h = img.size
-                TARGET = 800
-                if max(w, h) < TARGET:
-                    scale = TARGET / max(w, h)
+                TARGET = 1200
+                scale = TARGET / max(w, h)
+                if scale > 1:
                     new_w, new_h = int(w * scale), int(h * scale)
                     img = img.resize((new_w, new_h), Image.LANCZOS)
-                    buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=88)
-                    photo_bytes = buf.getvalue()
-                    mime = "image/jpeg"
-                    ext  = "jpg"
+                    img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2))
                     log.info(f"Upscaled {w}x{h} → {new_w}x{new_h}")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=95)
+                photo_bytes = buf.getvalue()
+                mime = "image/jpeg"
+                ext  = "jpg"
             except Exception as e:
                 log.warning(f"Upscale failed, sending original: {e}")
 
+            # sendDocument — Telegram does NOT compress, tap opens full image
             tg_r = await client.post(
-                f"{tg_base}/sendPhoto",
+                f"{tg_base}/sendDocument",
                 data={"chat_id": chat_id, "caption": caption},
-                files={"photo": (f"photo.{ext}", photo_bytes, mime)},
+                files={"document": (f"photo.{ext}", photo_bytes, mime)},
             )
             tg_j = tg_r.json()
             log.info(f"sendPhoto ok={tg_j.get('ok')} "
@@ -297,5 +300,5 @@ async def send_photo(
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.1.0-upscale",
+    return {"status": "ok", "version": "3.2.0-document",
             "max_concurrent": MAX_CONC}
