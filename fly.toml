@@ -4,7 +4,7 @@
 #
 
 app = 'photo-api'
-primary_region = 'iad'
+primary_region = 'sin'
 
 [build]
 

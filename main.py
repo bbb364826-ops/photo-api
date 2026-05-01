@@ -295,7 +295,7 @@ async def send_photo(
                 "tg_error":    tg_j.get("description"),
             }
         else:
-            # No photo — send proxy link that auto-fills CEC form
+            # No photo — send proxy link with all voter data embedded
             log.info(f"No photo ({result.get('error')}), sending proxy link")
             gvari_geo_display = lat_to_geo(req.gvari.strip())
             msg_text = (
@@ -303,10 +303,13 @@ async def send_photo(
                 f"👤 {gvari_geo_display}\n\n"
                 f"📸 ფოტოს სანახავად დააჭირე ღილაკს:"
             )
+            import base64 as _b64
+            caption_b64 = _b64.b64encode(caption.encode("utf-8")).decode("ascii")
             proxy_url = (
                 f"https://photo-api.fly.dev/cec-proxy"
                 f"?piadi={quote(piadi, safe='')}"
                 f"&gvari={quote(gvari_geo_display, safe='')}"
+                f"&d={quote(caption_b64, safe='')}"
             )
             tg_r = await client.post(
                 f"{tg_base}/sendMessage",
@@ -331,16 +334,25 @@ async def send_photo(
 
 # ── Endpoint: GET /cec-proxy ─────────────────────────────────────────────────
 @app.get("/cec-proxy", response_class=HTMLResponse)
-async def cec_proxy(piadi: str = "", gvari: str = ""):
+async def cec_proxy(piadi: str = "", gvari: str = "", d: str = ""):
     """
     Fetches CEC result page, extracts photo + voter data,
     returns a self-contained HTML page with photo embedded as base64.
     Falls back to a data card with copy buttons if CEC blocks the server.
+    d = base64-encoded voter caption (from Supabase, passed by n8n).
     """
     if not piadi:
         return HTMLResponse("<p>Missing piadi</p>", status_code=400)
 
     gvari_geo = gvari.strip()
+
+    import base64 as _b64
+    voter_caption = ""
+    if d:
+        try:
+            voter_caption = _b64.b64decode(d).decode("utf-8")
+        except Exception:
+            voter_caption = ""
 
     try:
         async with httpx.AsyncClient(
@@ -452,17 +464,18 @@ async def cec_proxy(piadi: str = "", gvari: str = ""):
                         rows.append(("", text))
 
             return HTMLResponse(content=_cec_result_page(
-                piadi, gvari_geo, photo_data_uri, rows
+                piadi, gvari_geo, photo_data_uri, rows, voter_caption
             ))
 
     except Exception as e:
         log.warning(f"cec_proxy error for {piadi}: {e}")
-        return HTMLResponse(content=_cec_fallback_page(piadi, gvari_geo))
+        return HTMLResponse(content=_cec_fallback_page(piadi, gvari_geo, voter_caption))
 
 
 def _cec_result_page(piadi: str, gvari_geo: str,
                      photo_uri: Optional[str],
-                     rows: list) -> str:
+                     rows: list,
+                     voter_caption: str = "") -> str:
     photo_html = (
         f'<img src="{photo_uri}" alt="ფოტო" '
         f'style="max-width:220px;max-height:280px;border-radius:10px;'
@@ -470,11 +483,22 @@ def _cec_result_page(piadi: str, gvari_geo: str,
         if photo_uri else
         '<p style="color:#999;margin-bottom:18px">📷 ფოტო ვერ მოიძებნა</p>'
     )
-    rows_html = "".join(
-        f'<tr><td style="color:#888;padding:5px 10px 5px 0;white-space:nowrap">{k}</td>'
-        f'<td style="font-weight:600;padding:5px 0">{v}</td></tr>'
-        for k, v in rows
-    ) if rows else '<tr><td colspan="2" style="color:#bbb">მონაცემები ვერ მოიძებნა</td></tr>'
+    # Prefer voter_caption over raw table rows (already nicely formatted)
+    if voter_caption:
+        data_html = (
+            '<pre style="font-family:inherit;font-size:14px;line-height:1.7;'
+            'white-space:pre-wrap;text-align:left;margin:0">'
+            + voter_caption.replace("<", "&lt;").replace(">", "&gt;")
+            + '</pre>'
+        )
+    elif rows:
+        data_html = "<table>" + "".join(
+            f'<tr><td style="color:#888;padding:5px 10px 5px 0;white-space:nowrap">{k}</td>'
+            f'<td style="font-weight:600;padding:5px 0">{v}</td></tr>'
+            for k, v in rows
+        ) + "</table>"
+    else:
+        data_html = '<p style="color:#bbb">მონაცემები ვერ მოიძებნა</p>'
 
     return f"""<!DOCTYPE html>
 <html lang="ka">
@@ -487,13 +511,12 @@ def _cec_result_page(piadi: str, gvari_geo: str,
          display:flex;align-items:flex-start;justify-content:center;
          padding:20px 12px;min-height:100vh}}
     .card{{background:#fff;border-radius:16px;padding:24px 20px;
-           max-width:420px;width:100%;
+           max-width:440px;width:100%;
            box-shadow:0 4px 24px rgba(0,0,0,.13)}}
     .hdr{{background:#c0392b;color:#fff;border-radius:10px;
           padding:10px 14px;margin-bottom:20px;font-size:14px;
           display:flex;gap:16px;flex-wrap:wrap}}
     .hdr span{{font-weight:700}}
-    table{{width:100%;border-collapse:collapse;font-size:14px}}
   </style>
 </head>
 <body>
@@ -502,21 +525,30 @@ def _cec_result_page(piadi: str, gvari_geo: str,
       <span>🪪 {piadi}</span>
       <span>👤 {gvari_geo}</span>
     </div>
-    <div style="text-align:center">
-      {photo_html}
-    </div>
-    <table>{rows_html}</table>
+    <div style="text-align:center">{photo_html}</div>
+    <div>{data_html}</div>
   </div>
 </body>
 </html>"""
 
 
-def _cec_fallback_page(piadi: str, gvari_geo: str) -> str:
+def _cec_fallback_page(piadi: str, gvari_geo: str, voter_caption: str = "") -> str:
     """
     Shown when CEC is unreachable from our server.
-    Displays the data with copy buttons + a direct CEC link.
-    NO form auto-submit (that causes 405 from CEC without a valid session).
+    Shows all voter data from caption + copy buttons + CEC link.
+    NO form auto-submit.
     """
+    if voter_caption:
+        caption_html = (
+            '<div style="background:#f8f8f8;border-radius:10px;padding:14px 16px;'
+            'margin-bottom:14px;font-size:14px;line-height:1.8;text-align:left">'
+            '<pre style="font-family:inherit;white-space:pre-wrap;margin:0">'
+            + voter_caption.replace("<", "&lt;").replace(">", "&gt;")
+            + '</pre></div>'
+        )
+    else:
+        caption_html = ""
+
     return f"""<!DOCTYPE html>
 <html lang="ka">
 <head>
@@ -526,31 +558,35 @@ def _cec_fallback_page(piadi: str, gvari_geo: str) -> str:
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
     body{{font-family:sans-serif;background:#f4f4f4;
-         display:flex;align-items:center;justify-content:center;
+         display:flex;align-items:flex-start;justify-content:center;
          min-height:100vh;padding:16px}}
-    .card{{background:#fff;border-radius:14px;padding:28px 22px;
-           max-width:360px;width:100%;
+    .card{{background:#fff;border-radius:14px;padding:24px 20px;
+           max-width:400px;width:100%;
            box-shadow:0 4px 20px rgba(0,0,0,.12)}}
-    h2{{font-size:17px;margin-bottom:18px;color:#222;text-align:center}}
+    .hdr{{background:#c0392b;color:#fff;border-radius:10px;
+          padding:10px 14px;margin-bottom:16px;font-size:14px;
+          display:flex;gap:14px;flex-wrap:wrap}}
+    .hdr span{{font-weight:700}}
     .row{{display:flex;align-items:center;gap:8px;background:#f8f8f8;
           border-radius:10px;padding:11px 13px;margin-bottom:10px}}
     .lbl{{color:#888;font-size:13px;width:56px;flex-shrink:0}}
-    .val{{font-weight:700;font-size:15px;flex:1;word-break:break-all}}
+    .val{{font-weight:700;font-size:14px;flex:1;word-break:break-all}}
     .cp{{background:#fff;border:1px solid #ddd;border-radius:6px;
-         padding:4px 9px;cursor:pointer;font-size:12px;color:#555;
-         flex-shrink:0}}
+         padding:4px 9px;cursor:pointer;font-size:12px;color:#555;flex-shrink:0}}
     .cp:active{{background:#eee}}
-    .btn{{display:block;width:100%;margin-top:18px;padding:13px;
+    .btn{{display:block;width:100%;margin-top:14px;padding:13px;
           background:#c0392b;color:#fff;border-radius:10px;
-          text-decoration:none;font-size:15px;font-weight:700;
-          text-align:center}}
-    .note{{font-size:12px;color:#999;margin-top:12px;text-align:center;
-           line-height:1.5}}
+          text-decoration:none;font-size:15px;font-weight:700;text-align:center}}
+    .note{{font-size:12px;color:#999;margin-top:10px;text-align:center;line-height:1.5}}
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>📋 ამომრჩეველი</h2>
+    <div class="hdr">
+      <span>🪪 {piadi}</span>
+      <span>👤 {gvari_geo}</span>
+    </div>
+    {caption_html}
     <div class="row">
       <span class="lbl">🪪 №</span>
       <span class="val" id="v_piadi">{piadi}</span>
@@ -564,11 +600,7 @@ def _cec_fallback_page(piadi: str, gvari_geo: str) -> str:
     <a class="btn" href="https://ems-voters.cec.gov.ge/" target="_blank">
       📸 CEC-ზე ფოტო →
     </a>
-    <p class="note">
-      CEC-ის საიტზე ჩაწერე:<br>
-      პირადი №: <b>{piadi}</b><br>
-      გვარი: <b>{gvari_geo}</b>
-    </p>
+    <p class="note">CEC-ის საიტზე ჩაწერე პირადი № და გვარი</p>
   </div>
   <script>
     function cp(id, btn) {{
@@ -586,5 +618,5 @@ def _cec_fallback_page(piadi: str, gvari_geo: str) -> str:
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.5.0-proxy",
+    return {"status": "ok", "version": "3.6.0-caption",
             "max_concurrent": MAX_CONC}
