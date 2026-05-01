@@ -741,6 +741,7 @@ tryNext();
 @app.get("/cec-test")
 async def cec_test():
     """Check if we can reach CEC (via proxy or directly)."""
+    import traceback
     try:
         async with _cec_client(timeout=30) as client:
             r = await client.get(CEC_URL)
@@ -751,9 +752,15 @@ async def cec_test():
                 "proxy":    bool(_PROXY),
                 "has_csrf": has_csrf,
                 "url":      str(r.url),
+                "body_start": r.text[:200],
             }
     except Exception as e:
-        return {"ok": False, "proxy": bool(_PROXY), "error": str(e)[:300]}
+        return {
+            "ok":    False,
+            "proxy": bool(_PROXY),
+            "error": repr(e),
+            "trace": traceback.format_exc()[-500:],
+        }
 
 
 # ── Health check ─────────────────────────────────────────────────────────────
