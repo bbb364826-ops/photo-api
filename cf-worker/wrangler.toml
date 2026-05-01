@@ -1,0 +1,7 @@
+name = "cec-proxy"
+main = "index.js"
+compatibility_date = "2024-09-23"
+
+# Run in EU region (closer to Georgia → less likely blocked)
+[placement]
+mode = "smart"

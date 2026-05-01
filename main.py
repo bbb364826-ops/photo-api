@@ -32,9 +32,9 @@ BOT_TOKEN        = os.getenv("BOT_TOKEN", "8789371314:AAHZ4E2x7k-qB08D2l3EWUqgZ-
 API_KEY          = os.getenv("API_KEY", "")
 MAX_CONC         = int(os.getenv("MAX_CONCURRENT", "5"))
 SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY", "")
+CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "")   # e.g. https://cec-proxy.xxx.workers.dev
 
 # ScraperAPI REST endpoint — bypasses CEC IP block via residential IPs
-# Free tier: 1000 req/month — https://www.scraperapi.com/
 _SA_BASE = "https://api.scraperapi.com/"
 
 def _cec_client(timeout: float = 20) -> httpx.AsyncClient:
@@ -124,6 +124,27 @@ class SendPhotoRequest(BaseModel):
     caption: str
 
 
+# ── Cloudflare Worker fast-path ──────────────────────────────────────────────
+async def _fetch_via_worker(piadi: str, gvari_geo: str) -> dict:
+    """Call the CF Worker which fetches CEC from its own edge IP."""
+    try:
+        async with httpx.AsyncClient(timeout=40) as client:
+            r = await client.get(
+                CF_WORKER_URL,
+                params={"piadi": piadi, "gvari": gvari_geo},
+            )
+        ct = r.headers.get("content-type", "")
+        if "image" in ct:
+            return {"success": True, "photo_bytes": r.content,
+                    "mime": ct.split(";")[0].strip()}
+        data = r.json()
+        return {"success": False, "photo_bytes": None, "mime": None,
+                "error": data.get("error", "worker_error")}
+    except Exception as e:
+        log.warning(f"CF Worker error: {e}")
+        return {"success": False, "error": f"worker: {e}"}
+
+
 # ── Core: HTTP-based CEC photo fetch (no browser) ──────────────────────────
 async def fetch_cec_photo(piadi: str, gvari_geo: str) -> dict:
     """
@@ -133,6 +154,10 @@ async def fetch_cec_photo(piadi: str, gvari_geo: str) -> dict:
     4. Download photo bytes
     Returns: {success, photo_bytes, mime, error}
     """
+    # Fast-path: Cloudflare Worker (different IP, bypasses CEC block)
+    if CF_WORKER_URL:
+        return await _fetch_via_worker(piadi, gvari_geo)
+
     async with _sem:
         try:
             async with _cec_client(timeout=55) as client:
@@ -815,6 +840,7 @@ async def cec_test():
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "4.0.0-scraper-api",
+    return {"status": "ok", "version": "4.1.0-cf-worker",
+            "cf_worker": bool(CF_WORKER_URL),
             "scraper": bool(SCRAPER_API_KEY),
             "max_concurrent": MAX_CONC}
