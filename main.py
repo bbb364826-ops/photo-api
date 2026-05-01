@@ -534,20 +534,23 @@ def _cec_result_page(piadi: str, gvari_geo: str,
 
 def _cec_fallback_page(piadi: str, gvari_geo: str, voter_caption: str = "") -> str:
     """
-    Shown when CEC is unreachable from our server.
-    Shows all voter data from caption + copy buttons + CEC link.
-    NO form auto-submit.
+    Browser-side strategy:
+    1. JS tries to load CEC photo directly via <img> (user's browser, no IP block)
+    2. If photo loads → show photo + voter data immediately
+    3. If photo needs a session → prefetch CEC homepage (sets cookie), retry
+    4. If still no photo → embed CEC in full-page iframe (user sees real CEC)
+    5. Last resort → static card with data + CEC link
     """
-    if voter_caption:
-        caption_html = (
-            '<div style="background:#f8f8f8;border-radius:10px;padding:14px 16px;'
-            'margin-bottom:14px;font-size:14px;line-height:1.8;text-align:left">'
-            '<pre style="font-family:inherit;white-space:pre-wrap;margin:0">'
-            + voter_caption.replace("<", "&lt;").replace(">", "&gt;")
-            + '</pre></div>'
-        )
-    else:
-        caption_html = ""
+    import json as _json
+    caption_html = (
+        '<pre style="font-family:inherit;white-space:pre-wrap;margin:0;'
+        'font-size:14px;line-height:1.75">'
+        + voter_caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        + '</pre>'
+    ) if voter_caption else '<p style="color:#aaa">მონაცემები არ არის</p>'
+
+    piadi_js  = _json.dumps(piadi)
+    gvari_js  = _json.dumps(gvari_geo)
 
     return f"""<!DOCTYPE html>
 <html lang="ka">
@@ -557,60 +560,171 @@ def _cec_fallback_page(piadi: str, gvari_geo: str, voter_caption: str = "") -> s
   <title>ამომრჩეველი {piadi}</title>
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{font-family:sans-serif;background:#f4f4f4;
-         display:flex;align-items:flex-start;justify-content:center;
-         min-height:100vh;padding:16px}}
-    .card{{background:#fff;border-radius:14px;padding:24px 20px;
-           max-width:400px;width:100%;
-           box-shadow:0 4px 20px rgba(0,0,0,.12)}}
+    body{{font-family:sans-serif;background:#f0f2f5;min-height:100vh}}
+
+    /* ── loading ── */
+    #s-load{{display:flex;flex-direction:column;align-items:center;
+             justify-content:center;min-height:100vh;gap:14px}}
+    .spin{{width:44px;height:44px;border:5px solid #ddd;
+           border-top-color:#c0392b;border-radius:50%;
+           animation:sp .8s linear infinite}}
+    @keyframes sp{{to{{transform:rotate(360deg)}}}}
+
+    /* ── result card ── */
+    #s-result{{display:none;padding:16px}}
+    .card{{background:#fff;border-radius:16px;padding:20px;
+           max-width:440px;margin:0 auto;
+           box-shadow:0 4px 20px rgba(0,0,0,.13)}}
     .hdr{{background:#c0392b;color:#fff;border-radius:10px;
           padding:10px 14px;margin-bottom:16px;font-size:14px;
           display:flex;gap:14px;flex-wrap:wrap}}
-    .hdr span{{font-weight:700}}
-    .row{{display:flex;align-items:center;gap:8px;background:#f8f8f8;
-          border-radius:10px;padding:11px 13px;margin-bottom:10px}}
-    .lbl{{color:#888;font-size:13px;width:56px;flex-shrink:0}}
-    .val{{font-weight:700;font-size:14px;flex:1;word-break:break-all}}
-    .cp{{background:#fff;border:1px solid #ddd;border-radius:6px;
-         padding:4px 9px;cursor:pointer;font-size:12px;color:#555;flex-shrink:0}}
-    .cp:active{{background:#eee}}
-    .btn{{display:block;width:100%;margin-top:14px;padding:13px;
-          background:#c0392b;color:#fff;border-radius:10px;
-          text-decoration:none;font-size:15px;font-weight:700;text-align:center}}
-    .note{{font-size:12px;color:#999;margin-top:10px;text-align:center;line-height:1.5}}
+    .hdr b{{font-weight:700}}
+    .photo-box{{text-align:center;margin-bottom:14px}}
+    .photo-box img{{max-width:200px;max-height:260px;border-radius:10px;
+                    box-shadow:0 4px 14px rgba(0,0,0,.22)}}
+    .data-box{{background:#f8f8f8;border-radius:10px;padding:12px 14px}}
+
+    /* ── iframe overlay ── */
+    #s-iframe{{display:none}}
+    #bar{{position:fixed;top:0;left:0;right:0;z-index:9999;
+          background:#c0392b;color:#fff;padding:7px 10px;
+          display:flex;gap:6px;align-items:center;flex-wrap:wrap;
+          font-size:13px}}
+    #bar b{{font-weight:700}}
+    .cbtn{{background:rgba(255,255,255,.25);border:1px solid rgba(255,255,255,.5);
+           color:#fff;border-radius:6px;padding:3px 9px;cursor:pointer;font-size:12px}}
+    #frm{{position:fixed;top:40px;left:0;right:0;bottom:0;
+          width:100%;height:calc(100vh - 40px);border:none}}
+
+    /* ── static last-resort ── */
+    #s-static{{display:none;padding:16px}}
+    .btn-cec{{display:block;width:100%;padding:13px;background:#c0392b;color:#fff;
+              border-radius:10px;text-decoration:none;font-size:15px;
+              font-weight:700;text-align:center;margin-top:14px}}
   </style>
 </head>
 <body>
+
+<div id="s-load">
+  <div class="spin"></div>
+  <p style="color:#666;font-size:15px">ფოტოს ძებნა...</p>
+</div>
+
+<div id="s-result">
   <div class="card">
-    <div class="hdr">
-      <span>🪪 {piadi}</span>
-      <span>👤 {gvari_geo}</span>
-    </div>
-    {caption_html}
-    <div class="row">
-      <span class="lbl">🪪 №</span>
-      <span class="val" id="v_piadi">{piadi}</span>
-      <button class="cp" onclick="cp('v_piadi',this)">კოპირება</button>
-    </div>
-    <div class="row">
-      <span class="lbl">👤 გვარი</span>
-      <span class="val" id="v_gvari">{gvari_geo}</span>
-      <button class="cp" onclick="cp('v_gvari',this)">კოპირება</button>
-    </div>
-    <a class="btn" href="https://ems-voters.cec.gov.ge/" target="_blank">
+    <div class="hdr"><b>🪪 {piadi}</b><b>👤 {gvari_geo}</b></div>
+    <div class="photo-box"><img id="ph" src="" alt="ფოტო"></div>
+    <div class="data-box">{caption_html}</div>
+  </div>
+</div>
+
+<div id="s-iframe">
+  <div id="bar">
+    <b>🪪</b><b id="bp">{piadi}</b>
+    <button class="cbtn" onclick="cb('bp',this)">📋 კოპირება</button>
+    <b>👤</b><b id="bg">{gvari_geo}</b>
+    <button class="cbtn" onclick="cb('bg',this)">📋 კოპირება</button>
+  </div>
+  <iframe id="frm" src="about:blank"></iframe>
+</div>
+
+<div id="s-static">
+  <div class="card" style="max-width:400px;margin:20px auto">
+    <div class="hdr"><b>🪪 {piadi}</b><b>👤 {gvari_geo}</b></div>
+    <div class="data-box">{caption_html}</div>
+    <a class="btn-cec" href="https://ems-voters.cec.gov.ge/" target="_blank">
       📸 CEC-ზე ფოტო →
     </a>
-    <p class="note">CEC-ის საიტზე ჩაწერე პირადი № და გვარი</p>
   </div>
-  <script>
-    function cp(id, btn) {{
-      navigator.clipboard.writeText(document.getElementById(id).textContent)
-        .then(function() {{
-          btn.textContent = '✓';
-          setTimeout(function() {{ btn.textContent = 'კოპირება'; }}, 1500);
-        }});
+</div>
+
+<script>
+var P = {piadi_js};
+var G = {gvari_js};
+var done = false;
+
+function only(id) {{
+  ['s-load','s-result','s-iframe','s-static'].forEach(function(x){{
+    document.getElementById(x).style.display = x===id ? 'block' : 'none';
+  }});
+  done = true;
+}}
+
+/* ── show photo result ── */
+function showPhoto(src) {{
+  document.getElementById('ph').src = src;
+  only('s-result');
+}}
+
+/* ── direct photo URL candidates ── */
+var base = 'https://ems-voters.cec.gov.ge/';
+var urls = [
+  base + 'GetPhoto?personalId=' + P,
+  base + 'GetPhoto?PersonalId=' + P,
+  base + 'Voter/GetPhoto?personalId=' + P,
+  base + 'Handler/GetPhoto?personalId=' + P,
+  base + 'GetPhoto?id=' + P,
+  base + 'api/voter/' + P + '/photo',
+];
+var ui = 0;
+var phase = 0; /* 0 = direct, 1 = after prefetch */
+
+function tryNext() {{
+  if (done) return;
+  if (ui >= urls.length) {{
+    if (phase === 0) {{
+      /* Phase 1: prefetch CEC to set session cookie, then retry all */
+      phase = 1; ui = 0;
+      fetch(base, {{mode:'no-cors', credentials:'include'}})
+        .then(function() {{ setTimeout(tryNext, 400); }})
+        .catch(function() {{ tryIframe(); }});
+    }} else {{
+      tryIframe();
     }}
-  </script>
+    return;
+  }}
+  var img = new Image();
+  var cur = urls[ui++];
+  img.onload = function() {{ if (!done) showPhoto(cur); }};
+  img.onerror = function() {{ if (!done) tryNext(); }};
+  /* timeout per attempt */
+  setTimeout(function() {{ if (!done) tryNext(); }}, 2500);
+  img.src = cur;
+}}
+
+/* ── CEC in iframe ── */
+function tryIframe() {{
+  if (done) return;
+  only('s-iframe');
+  var f = document.getElementById('frm');
+  var t = setTimeout(function() {{ only('s-static'); }}, 10000);
+  f.onload = function() {{
+    clearTimeout(t);
+    try {{
+      /* if cross-origin SecurityError → CEC loaded fine */
+      var _ = f.contentDocument.body;
+      /* same-origin or blocked (empty page) */
+      if (!_ || _.innerHTML.trim() === '') only('s-static');
+    }} catch(e) {{
+      /* SecurityError = CEC is in the iframe! */
+    }}
+  }};
+  f.onerror = function() {{ clearTimeout(t); only('s-static'); }};
+  f.src = base;
+}}
+
+/* ── clipboard ── */
+function cb(id, btn) {{
+  navigator.clipboard.writeText(document.getElementById(id).textContent)
+    .then(function() {{
+      btn.textContent = '✓';
+      setTimeout(function() {{ btn.textContent = '📋 კოპირება'; }}, 1500);
+    }}).catch(function() {{}});
+}}
+
+/* kick off */
+tryNext();
+</script>
 </body>
 </html>"""
 
@@ -618,5 +732,5 @@ def _cec_fallback_page(piadi: str, gvari_geo: str, voter_caption: str = "") -> s
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.6.0-caption",
+    return {"status": "ok", "version": "3.7.0-browser",
             "max_concurrent": MAX_CONC}
