@@ -40,6 +40,14 @@ _PROXY = (
     if SCRAPER_API_KEY else None
 )
 
+def _cec_client(timeout: float = 20) -> httpx.AsyncClient:
+    """Return httpx client for CEC — uses residential proxy when key is set."""
+    kw: dict = {"headers": HEADERS, "follow_redirects": True, "timeout": timeout}
+    if _PROXY:
+        kw["proxies"] = {"https://": _PROXY, "http://": _PROXY}
+        kw["verify"]  = False          # ScraperAPI HTTPS tunnel needs this
+    return httpx.AsyncClient(**kw)
+
 _sem = asyncio.Semaphore(MAX_CONC)
 
 CEC_URL    = "https://ems-voters.cec.gov.ge/"
@@ -99,12 +107,7 @@ async def fetch_cec_photo(piadi: str, gvari_geo: str) -> dict:
     """
     async with _sem:
         try:
-            async with httpx.AsyncClient(
-                headers=HEADERS,
-                follow_redirects=True,
-                timeout=35 if _PROXY else 20,
-                proxies=_PROXY,
-            ) as client:
+            async with _cec_client(timeout=35 if _PROXY else 20) as client:
 
                 # ── Step 1: GET homepage, grab CSRF token ───────────────
                 r1 = await client.get(CEC_URL)
@@ -364,12 +367,7 @@ async def cec_proxy(piadi: str = "", gvari: str = "", d: str = ""):
             voter_caption = ""
 
     try:
-        async with httpx.AsyncClient(
-            headers=HEADERS,
-            follow_redirects=True,
-            timeout=35 if _PROXY else 25,
-            proxies=_PROXY,
-        ) as client:
+        async with _cec_client(timeout=35 if _PROXY else 25) as client:
             # Step 1: GET homepage → CSRF token
             r1 = await client.get(CEC_URL)
             r1.raise_for_status()
@@ -739,9 +737,28 @@ tryNext();
 </html>"""
 
 
+# ── Debug: test CEC connectivity ─────────────────────────────────────────────
+@app.get("/cec-test")
+async def cec_test():
+    """Check if we can reach CEC (via proxy or directly)."""
+    try:
+        async with _cec_client(timeout=30) as client:
+            r = await client.get(CEC_URL)
+            has_csrf = "__RequestVerificationToken" in r.text
+            return {
+                "ok":       r.status_code == 200,
+                "status":   r.status_code,
+                "proxy":    bool(_PROXY),
+                "has_csrf": has_csrf,
+                "url":      str(r.url),
+            }
+    except Exception as e:
+        return {"ok": False, "proxy": bool(_PROXY), "error": str(e)[:300]}
+
+
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.8.0-proxy",
+    return {"status": "ok", "version": "3.9.0-proxy-fix",
             "proxy": bool(_PROXY),
             "max_concurrent": MAX_CONC}
