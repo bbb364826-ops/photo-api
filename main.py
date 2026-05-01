@@ -333,14 +333,14 @@ async def send_photo(
 @app.get("/cec-proxy", response_class=HTMLResponse)
 async def cec_proxy(piadi: str = "", gvari: str = ""):
     """
-    Server-side proxy: fetches CEC result page and returns it with
-    all relative URLs rewritten to absolute CEC URLs, so the user's
-    browser renders the real result (photo + voter data) immediately.
+    Fetches CEC result page, extracts photo + voter data,
+    returns a self-contained HTML page with photo embedded as base64.
+    Falls back to a data card with copy buttons if CEC blocks the server.
     """
     if not piadi:
         return HTMLResponse("<p>Missing piadi</p>", status_code=400)
 
-    gvari_geo = gvari.strip()  # already Georgian from send_photo
+    gvari_geo = gvari.strip()
 
     try:
         async with httpx.AsyncClient(
@@ -372,99 +372,212 @@ async def cec_proxy(piadi: str = "", gvari: str = ""):
             )
             r2.raise_for_status()
 
-            html = r2.text
-            base = CEC_URL.rstrip("/")
+            soup2 = BeautifulSoup(r2.text, "html.parser")
 
-            # Rewrite relative src/href to absolute CEC URLs
-            html = re.sub(
-                r'((?:src|href|action)\s*=\s*")(/[^"]*)"',
-                lambda m: f'{m.group(1)}{base}{m.group(2)}"',
-                html,
-            )
-            html = re.sub(
-                r"((?:src|href|action)\s*=\s*')(/[^']*)'",
-                lambda m: f"{m.group(1)}{base}{m.group(2)}'",
-                html,
-            )
-            # Rewrite url(...) in inline styles
-            html = re.sub(
-                r'url\(["\']?(/[^)"\']+)["\']?\)',
-                lambda m: f'url("{base}{m.group(1)}")',
-                html,
-            )
+            # ── Find photo src ──────────────────────────────────────────────
+            photo_src = None
+            for sel in [
+                "img[src*='GetPhoto']", "img[src*='Photo']",
+                "img[src*='photo']",    "img[src*='Handler']",
+                "img[src*='Image']",    ".voter-photo img",
+                ".photo img",           ".result img",
+            ]:
+                el = soup2.select_one(sel)
+                if el and el.get("src"):
+                    photo_src = el["src"]
+                    break
+            if not photo_src:
+                for img_tag in soup2.find_all("img"):
+                    src = img_tag.get("src", "")
+                    if (src and not src.endswith((".svg", ".ico"))
+                            and "logo" not in src.lower()
+                            and "icon" not in src.lower()
+                            and len(src) > 5):
+                        photo_src = src
+                        break
 
-            # Inject info bar at top of page
-            bar = (
-                f'<div style="position:fixed;top:0;left:0;right:0;z-index:9999;'
-                f'background:#c0392b;color:#fff;padding:8px 16px;font-size:15px;'
-                f'font-family:sans-serif;display:flex;gap:20px;align-items:center;'
-                f'box-shadow:0 2px 6px rgba(0,0,0,.3)">'
-                f'<span>🪪 {piadi}</span>'
-                f'<span>👤 {gvari_geo}</span>'
-                f'</div>'
-                f'<div style="height:44px"></div>'
-            )
-            html = re.sub(r"(<body[^>]*>)", r"\1" + bar, html, flags=re.IGNORECASE)
+            # ── Download photo → base64 ─────────────────────────────────────
+            import base64 as _b64
+            photo_data_uri = None
+            if photo_src:
+                if photo_src.startswith("data:"):
+                    photo_data_uri = photo_src
+                else:
+                    if photo_src.startswith("/"):
+                        photo_src = CEC_URL.rstrip("/") + photo_src
+                    r3 = await client.get(
+                        photo_src, headers={**HEADERS, "Referer": CEC_URL}
+                    )
+                    if r3.status_code == 200:
+                        try:
+                            from PIL import ImageFilter
+                            img_obj = Image.open(io.BytesIO(r3.content)).convert("RGB")
+                            w, h = img_obj.size
+                            scale = 800 / max(w, h)
+                            if scale > 1:
+                                nw, nh = int(w * scale), int(h * scale)
+                                img_obj = img_obj.resize((nw, nh), Image.LANCZOS)
+                                img_obj = img_obj.filter(
+                                    ImageFilter.UnsharpMask(radius=1.5, percent=130, threshold=2)
+                                )
+                            buf = io.BytesIO()
+                            img_obj.save(buf, format="JPEG", quality=93)
+                            photo_data_uri = (
+                                "data:image/jpeg;base64,"
+                                + _b64.b64encode(buf.getvalue()).decode()
+                            )
+                        except Exception:
+                            photo_data_uri = (
+                                "data:image/jpeg;base64,"
+                                + _b64.b64encode(r3.content).decode()
+                            )
 
-            return HTMLResponse(content=html)
+            # ── Extract voter info rows from tables ─────────────────────────
+            rows: list[tuple[str, str]] = []
+            for table in soup2.find_all("table"):
+                for tr in table.find_all("tr"):
+                    cells = [td.get_text(" ", strip=True)
+                             for td in tr.find_all(["td", "th"])]
+                    if len(cells) >= 2 and cells[0] and cells[1]:
+                        rows.append((cells[0], cells[1]))
 
-    except httpx.HTTPStatusError as e:
-        log.warning(f"cec_proxy HTTP error {e.response.status_code} for {piadi}")
-        # Fallback: return auto-submit form page (user's browser, not our server, hits CEC)
-        return HTMLResponse(content=_cec_form_page(piadi, gvari_geo))
+            # Fallback: generic text blocks if no table
+            if not rows:
+                for div in soup2.select(
+                    ".voter-info,.info-row,.result-item,"
+                    "[class*='voter'],[class*='result'],[class*='info']"
+                ):
+                    text = div.get_text(" ", strip=True)
+                    if text and len(text) > 3:
+                        rows.append(("", text))
+
+            return HTMLResponse(content=_cec_result_page(
+                piadi, gvari_geo, photo_data_uri, rows
+            ))
+
     except Exception as e:
-        log.exception(f"cec_proxy error for {piadi}: {e}")
-        return HTMLResponse(content=_cec_form_page(piadi, gvari_geo))
+        log.warning(f"cec_proxy error for {piadi}: {e}")
+        return HTMLResponse(content=_cec_fallback_page(piadi, gvari_geo))
 
 
-def _cec_form_page(piadi: str, gvari_geo: str) -> str:
+def _cec_result_page(piadi: str, gvari_geo: str,
+                     photo_uri: Optional[str],
+                     rows: list) -> str:
+    photo_html = (
+        f'<img src="{photo_uri}" alt="ფოტო" '
+        f'style="max-width:220px;max-height:280px;border-radius:10px;'
+        f'box-shadow:0 4px 16px rgba(0,0,0,.25);margin-bottom:18px">'
+        if photo_uri else
+        '<p style="color:#999;margin-bottom:18px">📷 ფოტო ვერ მოიძებნა</p>'
+    )
+    rows_html = "".join(
+        f'<tr><td style="color:#888;padding:5px 10px 5px 0;white-space:nowrap">{k}</td>'
+        f'<td style="font-weight:600;padding:5px 0">{v}</td></tr>'
+        for k, v in rows
+    ) if rows else '<tr><td colspan="2" style="color:#bbb">მონაცემები ვერ მოიძებნა</td></tr>'
+
+    return f"""<!DOCTYPE html>
+<html lang="ka">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ამომრჩეველი {piadi}</title>
+  <style>
+    body{{margin:0;font-family:sans-serif;background:#f0f0f0;
+         display:flex;align-items:flex-start;justify-content:center;
+         padding:20px 12px;min-height:100vh}}
+    .card{{background:#fff;border-radius:16px;padding:24px 20px;
+           max-width:420px;width:100%;
+           box-shadow:0 4px 24px rgba(0,0,0,.13)}}
+    .hdr{{background:#c0392b;color:#fff;border-radius:10px;
+          padding:10px 14px;margin-bottom:20px;font-size:14px;
+          display:flex;gap:16px;flex-wrap:wrap}}
+    .hdr span{{font-weight:700}}
+    table{{width:100%;border-collapse:collapse;font-size:14px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="hdr">
+      <span>🪪 {piadi}</span>
+      <span>👤 {gvari_geo}</span>
+    </div>
+    <div style="text-align:center">
+      {photo_html}
+    </div>
+    <table>{rows_html}</table>
+  </div>
+</body>
+</html>"""
+
+
+def _cec_fallback_page(piadi: str, gvari_geo: str) -> str:
     """
-    Fallback HTML: auto-submits the CEC search form directly from the
-    user's browser (bypasses our server → no IP block).
+    Shown when CEC is unreachable from our server.
+    Displays the data with copy buttons + a direct CEC link.
+    NO form auto-submit (that causes 405 from CEC without a valid session).
     """
     return f"""<!DOCTYPE html>
 <html lang="ka">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>CEC — {piadi}</title>
+  <title>ამომრჩეველი {piadi}</title>
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{font-family:sans-serif;background:#f4f4f4;display:flex;
-         align-items:center;justify-content:center;min-height:100vh}}
-    .card{{background:#fff;border-radius:14px;padding:32px 28px;
-           max-width:340px;width:100%;text-align:center;
+    body{{font-family:sans-serif;background:#f4f4f4;
+         display:flex;align-items:center;justify-content:center;
+         min-height:100vh;padding:16px}}
+    .card{{background:#fff;border-radius:14px;padding:28px 22px;
+           max-width:360px;width:100%;
            box-shadow:0 4px 20px rgba(0,0,0,.12)}}
-    .spinner{{width:48px;height:48px;border:5px solid #eee;
-              border-top-color:#c0392b;border-radius:50%;
-              animation:spin .8s linear infinite;margin:0 auto 20px}}
-    @keyframes spin{{to{{transform:rotate(360deg)}}}}
-    .info{{font-size:15px;color:#444;margin-bottom:6px}}
-    .bold{{font-weight:700;font-size:16px;color:#222}}
-    .note{{font-size:13px;color:#888;margin-top:14px}}
+    h2{{font-size:17px;margin-bottom:18px;color:#222;text-align:center}}
+    .row{{display:flex;align-items:center;gap:8px;background:#f8f8f8;
+          border-radius:10px;padding:11px 13px;margin-bottom:10px}}
+    .lbl{{color:#888;font-size:13px;width:56px;flex-shrink:0}}
+    .val{{font-weight:700;font-size:15px;flex:1;word-break:break-all}}
+    .cp{{background:#fff;border:1px solid #ddd;border-radius:6px;
+         padding:4px 9px;cursor:pointer;font-size:12px;color:#555;
+         flex-shrink:0}}
+    .cp:active{{background:#eee}}
+    .btn{{display:block;width:100%;margin-top:18px;padding:13px;
+          background:#c0392b;color:#fff;border-radius:10px;
+          text-decoration:none;font-size:15px;font-weight:700;
+          text-align:center}}
+    .note{{font-size:12px;color:#999;margin-top:12px;text-align:center;
+           line-height:1.5}}
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="spinner"></div>
-    <p class="info">CEC-ის საიტზე გადამისამართება...</p>
-    <p class="bold">🪪 {piadi}</p>
-    <p class="bold">👤 {gvari_geo}</p>
-    <p class="note">ბრაუზერი ავტომატურად შეავსებს მონაცემებს</p>
+    <h2>📋 ამომრჩეველი</h2>
+    <div class="row">
+      <span class="lbl">🪪 №</span>
+      <span class="val" id="v_piadi">{piadi}</span>
+      <button class="cp" onclick="cp('v_piadi',this)">კოპირება</button>
+    </div>
+    <div class="row">
+      <span class="lbl">👤 გვარი</span>
+      <span class="val" id="v_gvari">{gvari_geo}</span>
+      <button class="cp" onclick="cp('v_gvari',this)">კოპირება</button>
+    </div>
+    <a class="btn" href="https://ems-voters.cec.gov.ge/" target="_blank">
+      📸 CEC-ზე ფოტო →
+    </a>
+    <p class="note">
+      CEC-ის საიტზე ჩაწერე:<br>
+      პირადი №: <b>{piadi}</b><br>
+      გვარი: <b>{gvari_geo}</b>
+    </p>
   </div>
-  <form id="f" action="https://ems-voters.cec.gov.ge/" method="POST"
-        style="display:none">
-    <input name="PersonalId" value="{piadi}">
-    <input name="Surname"    value="{gvari_geo}">
-    <input name="__RequestVerificationToken" value="">
-  </form>
   <script>
-    // Let browser establish CEC session first, then submit
-    window.addEventListener('load', function() {{
-      setTimeout(function() {{
-        document.getElementById('f').submit();
-      }}, 600);
-    }});
+    function cp(id, btn) {{
+      navigator.clipboard.writeText(document.getElementById(id).textContent)
+        .then(function() {{
+          btn.textContent = '✓';
+          setTimeout(function() {{ btn.textContent = 'კოპირება'; }}, 1500);
+        }});
+    }}
   </script>
 </body>
 </html>"""
