@@ -33,20 +33,48 @@ API_KEY          = os.getenv("API_KEY", "")
 MAX_CONC         = int(os.getenv("MAX_CONCURRENT", "5"))
 SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY", "")
 
-# Residential proxy via ScraperAPI — bypasses CEC IP block
-# Sign up free at scraperapi.com → 1000 req/month free
-_PROXY = (
-    f"http://scraperapi:{SCRAPER_API_KEY}@proxy-server.scraperapi.com:8001"
-    if SCRAPER_API_KEY else None
-)
+# ScraperAPI REST endpoint — bypasses CEC IP block via residential IPs
+# Free tier: 1000 req/month — https://www.scraperapi.com/
+_SA_BASE = "https://api.scraperapi.com/"
 
 def _cec_client(timeout: float = 20) -> httpx.AsyncClient:
-    """Return httpx client for CEC — uses residential proxy when key is set."""
-    kw: dict = {"headers": HEADERS, "follow_redirects": True, "timeout": timeout}
-    if _PROXY:
-        kw["proxies"] = {"https://": _PROXY, "http://": _PROXY}
-        kw["verify"]  = False          # ScraperAPI HTTPS tunnel needs this
-    return httpx.AsyncClient(**kw)
+    """Plain client for CEC or ScraperAPI REST calls."""
+    return httpx.AsyncClient(follow_redirects=True, timeout=timeout)
+
+
+async def _sa_get(client: httpx.AsyncClient, url: str,
+                  cookie: str = "") -> httpx.Response:
+    """GET via ScraperAPI REST API, forwarding custom headers to target."""
+    params: dict = {"api_key": SCRAPER_API_KEY, "url": url, "keep_headers": "true"}
+    hdrs = {**HEADERS, "Referer": CEC_URL}
+    if cookie:
+        hdrs["Cookie"] = cookie
+    return await client.get(_SA_BASE, params=params, headers=hdrs)
+
+
+async def _sa_post(client: httpx.AsyncClient, url: str,
+                   data: dict, cookie: str = "") -> httpx.Response:
+    """POST via ScraperAPI REST API."""
+    params: dict = {"api_key": SCRAPER_API_KEY, "url": url, "keep_headers": "true"}
+    hdrs = {
+        **HEADERS,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": url,
+    }
+    if cookie:
+        hdrs["Cookie"] = cookie
+    body = "&".join(f"{k}={httpx.QueryParams({k: v})[k]}" for k, v in data.items())
+    return await client.post(_SA_BASE, params=params, content=body.encode(), headers=hdrs)
+
+
+def _parse_cookies(resp: httpx.Response) -> str:
+    """Extract Set-Cookie pairs from response headers."""
+    pairs = []
+    for v in resp.headers.get_list("set-cookie"):
+        kv = v.split(";")[0].strip()
+        if "=" in kv:
+            pairs.append(kv)
+    return "; ".join(pairs)
 
 _sem = asyncio.Semaphore(MAX_CONC)
 
@@ -107,21 +135,26 @@ async def fetch_cec_photo(piadi: str, gvari_geo: str) -> dict:
     """
     async with _sem:
         try:
-            async with _cec_client(timeout=35 if _PROXY else 20) as client:
+            async with _cec_client(timeout=55) as client:
 
                 # ── Step 1: GET homepage, grab CSRF token ───────────────
-                r1 = await client.get(CEC_URL)
+                if SCRAPER_API_KEY:
+                    r1 = await _sa_get(client, CEC_URL)
+                else:
+                    r1 = await client.get(CEC_URL, headers=HEADERS)
                 r1.raise_for_status()
 
                 soup1 = BeautifulSoup(r1.text, "html.parser")
-
-                # ASP.NET CSRF token in hidden input
                 csrf_input = soup1.find(
                     "input", {"name": "__RequestVerificationToken"}
                 )
                 csrf_token = csrf_input["value"] if csrf_input else ""
                 if not csrf_token:
                     log.warning("No CSRF token found on CEC page")
+
+                cookie_str = _parse_cookies(r1) if SCRAPER_API_KEY else "; ".join(
+                    f"{k}={v}" for k, v in r1.cookies.items()
+                )
 
                 # ── Step 2: POST the search form ────────────────────────
                 form_data = {
@@ -130,18 +163,19 @@ async def fetch_cec_photo(piadi: str, gvari_geo: str) -> dict:
                     "Surname":    gvari_geo,
                 }
 
-                r2 = await client.post(
-                    CEC_URL,
-                    data=form_data,
-                    headers={
-                        **HEADERS,
-                        "Referer":      CEC_URL,
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Cookie":       "; ".join(
-                            f"{k}={v}" for k, v in r1.cookies.items()
-                        ),
-                    },
-                )
+                if SCRAPER_API_KEY:
+                    r2 = await _sa_post(client, CEC_URL, form_data, cookie=cookie_str)
+                else:
+                    r2 = await client.post(
+                        CEC_URL,
+                        data=form_data,
+                        headers={
+                            **HEADERS,
+                            "Referer":      CEC_URL,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Cookie":       cookie_str,
+                        },
+                    )
                 r2.raise_for_status()
 
                 soup2 = BeautifulSoup(r2.text, "html.parser")
@@ -220,10 +254,12 @@ async def fetch_cec_photo(piadi: str, gvari_geo: str) -> dict:
                 if photo_src.startswith("/"):
                     photo_src = CEC_URL.rstrip("/") + photo_src
 
-                r3 = await client.get(
-                    photo_src,
-                    headers={**HEADERS, "Referer": CEC_URL},
-                )
+                if SCRAPER_API_KEY:
+                    r3 = await _sa_get(client, photo_src, cookie=cookie_str)
+                else:
+                    r3 = await client.get(
+                        photo_src, headers={**HEADERS, "Referer": CEC_URL}
+                    )
                 if r3.status_code != 200:
                     return {"success": False,
                             "error": f"photo_download_{r3.status_code}"}
@@ -367,29 +403,39 @@ async def cec_proxy(piadi: str = "", gvari: str = "", d: str = ""):
             voter_caption = ""
 
     try:
-        async with _cec_client(timeout=35 if _PROXY else 25) as client:
+        async with _cec_client(timeout=55) as client:
             # Step 1: GET homepage → CSRF token
-            r1 = await client.get(CEC_URL)
+            if SCRAPER_API_KEY:
+                r1 = await _sa_get(client, CEC_URL)
+            else:
+                r1 = await client.get(CEC_URL, headers=HEADERS)
             r1.raise_for_status()
             soup1 = BeautifulSoup(r1.text, "html.parser")
             csrf_input = soup1.find("input", {"name": "__RequestVerificationToken"})
             csrf_token = csrf_input["value"] if csrf_input else ""
 
-            # Step 2: POST search form
-            r2 = await client.post(
-                CEC_URL,
-                data={
-                    "__RequestVerificationToken": csrf_token,
-                    "PersonalId": piadi,
-                    "Surname":    gvari_geo,
-                },
-                headers={
-                    **HEADERS,
-                    "Referer":      CEC_URL,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Cookie": "; ".join(f"{k}={v}" for k, v in r1.cookies.items()),
-                },
+            cookie_str = _parse_cookies(r1) if SCRAPER_API_KEY else "; ".join(
+                f"{k}={v}" for k, v in r1.cookies.items()
             )
+
+            # Step 2: POST search form
+            form_data = {
+                "__RequestVerificationToken": csrf_token,
+                "PersonalId": piadi,
+                "Surname":    gvari_geo,
+            }
+            if SCRAPER_API_KEY:
+                r2 = await _sa_post(client, CEC_URL, form_data, cookie=cookie_str)
+            else:
+                r2 = await client.post(
+                    CEC_URL, data=form_data,
+                    headers={
+                        **HEADERS,
+                        "Referer": CEC_URL,
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Cookie": cookie_str,
+                    },
+                )
             r2.raise_for_status()
 
             soup2 = BeautifulSoup(r2.text, "html.parser")
@@ -425,9 +471,12 @@ async def cec_proxy(piadi: str = "", gvari: str = "", d: str = ""):
                 else:
                     if photo_src.startswith("/"):
                         photo_src = CEC_URL.rstrip("/") + photo_src
-                    r3 = await client.get(
-                        photo_src, headers={**HEADERS, "Referer": CEC_URL}
-                    )
+                    if SCRAPER_API_KEY:
+                        r3 = await _sa_get(client, photo_src, cookie=cookie_str)
+                    else:
+                        r3 = await client.get(
+                            photo_src, headers={**HEADERS, "Referer": CEC_URL}
+                        )
                     if r3.status_code == 200:
                         try:
                             from PIL import ImageFilter
@@ -740,32 +789,32 @@ tryNext();
 # ── Debug: test CEC connectivity ─────────────────────────────────────────────
 @app.get("/cec-test")
 async def cec_test():
-    """Check if we can reach CEC (via proxy or directly)."""
+    """Check if we can reach CEC via ScraperAPI REST."""
     import traceback
     try:
-        async with _cec_client(timeout=30) as client:
-            r = await client.get(CEC_URL)
+        async with _cec_client(timeout=55) as client:
+            r = await (_sa_get(client, CEC_URL) if SCRAPER_API_KEY
+                       else client.get(CEC_URL, headers=HEADERS))
             has_csrf = "__RequestVerificationToken" in r.text
             return {
-                "ok":       r.status_code == 200,
-                "status":   r.status_code,
-                "proxy":    bool(_PROXY),
-                "has_csrf": has_csrf,
-                "url":      str(r.url),
-                "body_start": r.text[:200],
+                "ok":         r.status_code == 200,
+                "status":     r.status_code,
+                "scraper":    bool(SCRAPER_API_KEY),
+                "has_csrf":   has_csrf,
+                "body_start": r.text[:300],
             }
     except Exception as e:
         return {
             "ok":    False,
-            "proxy": bool(_PROXY),
+            "scraper": bool(SCRAPER_API_KEY),
             "error": repr(e),
-            "trace": traceback.format_exc()[-500:],
+            "trace": traceback.format_exc()[-600:],
         }
 
 
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.9.0-proxy-fix",
-            "proxy": bool(_PROXY),
+    return {"status": "ok", "version": "4.0.0-scraper-api",
+            "scraper": bool(SCRAPER_API_KEY),
             "max_concurrent": MAX_CONC}
