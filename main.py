@@ -28,9 +28,17 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8789371314:AAHZ4E2x7k-qB08D2l3EWUqgZ-8il0aU1wA")
-API_KEY   = os.getenv("API_KEY", "")
-MAX_CONC  = int(os.getenv("MAX_CONCURRENT", "5"))
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "8789371314:AAHZ4E2x7k-qB08D2l3EWUqgZ-8il0aU1wA")
+API_KEY          = os.getenv("API_KEY", "")
+MAX_CONC         = int(os.getenv("MAX_CONCURRENT", "5"))
+SCRAPER_API_KEY  = os.getenv("SCRAPER_API_KEY", "")
+
+# Residential proxy via ScraperAPI — bypasses CEC IP block
+# Sign up free at scraperapi.com → 1000 req/month free
+_PROXY = (
+    f"http://scraperapi:{SCRAPER_API_KEY}@proxy-server.scraperapi.com:8001"
+    if SCRAPER_API_KEY else None
+)
 
 _sem = asyncio.Semaphore(MAX_CONC)
 
@@ -94,7 +102,8 @@ async def fetch_cec_photo(piadi: str, gvari_geo: str) -> dict:
             async with httpx.AsyncClient(
                 headers=HEADERS,
                 follow_redirects=True,
-                timeout=20,
+                timeout=35 if _PROXY else 20,
+                proxies=_PROXY,
             ) as client:
 
                 # ── Step 1: GET homepage, grab CSRF token ───────────────
@@ -358,7 +367,8 @@ async def cec_proxy(piadi: str = "", gvari: str = "", d: str = ""):
         async with httpx.AsyncClient(
             headers=HEADERS,
             follow_redirects=True,
-            timeout=25,
+            timeout=35 if _PROXY else 25,
+            proxies=_PROXY,
         ) as client:
             # Step 1: GET homepage → CSRF token
             r1 = await client.get(CEC_URL)
@@ -732,5 +742,6 @@ tryNext();
 # ── Health check ─────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.7.0-browser",
+    return {"status": "ok", "version": "3.8.0-proxy",
+            "proxy": bool(_PROXY),
             "max_concurrent": MAX_CONC}
